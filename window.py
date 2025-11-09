@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import suppress
+import time
 from typing import Optional, Sequence, Tuple
 
 import cv2
@@ -15,6 +16,16 @@ FACE_CASCADE = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 )
 EYE_CASCADE = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+
+# Tuning constants for the mid-point smoothing filter.  ``ALPHA`` controls how much of
+# the raw measurement is blended into the filtered position every frame, ``BETA``
+# controls responsiveness to changes in velocity, and ``GAMMA`` determines how
+# aggressively acceleration corrections are applied.  ``MAX_DT`` limits the assumed
+# time between updates so sporadic frame stalls do not cause runaway predictions.
+FACE_FILTER_ALPHA = 0.65
+FACE_FILTER_BETA = 0.35
+FACE_FILTER_GAMMA = 0.1
+FACE_FILTER_MAX_DT = 1.0 / 15.0
 
 
 def _validate_cascade(cascade: cv2.CascadeClassifier, name: str) -> cv2.CascadeClassifier:
@@ -33,6 +44,63 @@ EYE_CASCADE = _validate_cascade(EYE_CASCADE, "eye")
 
 
 FaceRect = Tuple[int, int, int, int]
+
+
+class AlphaBetaGammaFilter:
+    """Smooth a series of 2D measurements while modelling constant acceleration."""
+
+    def __init__(self, alpha: float, beta: float, gamma: float) -> None:
+        self._alpha = alpha
+        self._beta = beta
+        self._gamma = gamma
+        self._position: Optional[Tuple[float, float]] = None
+        self._velocity: Tuple[float, float] = (0.0, 0.0)
+        self._acceleration: Tuple[float, float] = (0.0, 0.0)
+
+    def reset(self) -> None:
+        """Clear the filter's state so the next update re-initialises it."""
+
+        self._position = None
+        self._velocity = (0.0, 0.0)
+        self._acceleration = (0.0, 0.0)
+
+    def update(self, measurement: Tuple[int, int], dt: float) -> Tuple[float, float]:
+        """Incorporate ``measurement`` and return the filtered position."""
+
+        if dt <= 0:
+            dt = 0.0
+        dt = min(dt, FACE_FILTER_MAX_DT)
+
+        if self._position is None or dt == 0.0:
+            self._position = (float(measurement[0]), float(measurement[1]))
+            self._velocity = (0.0, 0.0)
+            self._acceleration = (0.0, 0.0)
+            return self._position
+
+        px, py = self._position
+        vx, vy = self._velocity
+        ax, ay = self._acceleration
+
+        # Predict where the subject should be given the current motion state.
+        pred_x = px + vx * dt + 0.5 * ax * dt * dt
+        pred_y = py + vy * dt + 0.5 * ay * dt * dt
+        pred_vx = vx + ax * dt
+        pred_vy = vy + ay * dt
+
+        residual_x = float(measurement[0]) - pred_x
+        residual_y = float(measurement[1]) - pred_y
+
+        px = pred_x + self._alpha * residual_x
+        py = pred_y + self._alpha * residual_y
+        vx = pred_vx + (self._beta / max(dt, 1e-6)) * residual_x
+        vy = pred_vy + (self._beta / max(dt, 1e-6)) * residual_y
+        ax = ax + (2.0 * self._gamma / max(dt * dt, 1e-6)) * residual_x
+        ay = ay + (2.0 * self._gamma / max(dt * dt, 1e-6)) * residual_y
+
+        self._position = (px, py)
+        self._velocity = (vx, vy)
+        self._acceleration = (ax, ay)
+        return self._position
 
 
 def _split_stereo_faces(faces: Sequence[FaceRect], frame_width: int) -> Tuple[list[FaceRect], list[FaceRect]]:
@@ -184,11 +252,22 @@ def open_capture(camera_index: int) -> cv2.VideoCapture:
 def display_feed(capture: cv2.VideoCapture, window_name: str) -> None:
     """Read frames from ``capture`` and display them until the user quits."""
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    left_filter = AlphaBetaGammaFilter(
+        FACE_FILTER_ALPHA, FACE_FILTER_BETA, FACE_FILTER_GAMMA
+    )
+    right_filter = AlphaBetaGammaFilter(
+        FACE_FILTER_ALPHA, FACE_FILTER_BETA, FACE_FILTER_GAMMA
+    )
+    last_time = time.perf_counter()
     try:
         while True:
             success, frame = capture.read()
             if not success:
                 raise RuntimeError("Failed to read frame from the webcam.")
+
+            now = time.perf_counter()
+            dt = now - last_time
+            last_time = now
 
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             faces = FACE_CASCADE.detectMultiScale(
@@ -199,9 +278,17 @@ def display_feed(capture: cv2.VideoCapture, window_name: str) -> None:
 
             if match is not None:
                 left_face, right_face = match
-                for face in (left_face, right_face):
+                for face, tracker in (
+                    (left_face, left_filter),
+                    (right_face, right_filter),
+                ):
                     midpoint = _estimate_eye_midpoint(face, gray)
-                    _draw_cross(frame, face, midpoint)
+                    filtered = tracker.update(midpoint, dt)
+                    filtered_point = (int(round(filtered[0])), int(round(filtered[1])))
+                    _draw_cross(frame, face, filtered_point)
+            else:
+                left_filter.reset()
+                right_filter.reset()
 
             cv2.imshow(window_name, frame)
 
