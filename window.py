@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import suppress
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 import cv2
 
@@ -30,6 +30,118 @@ def _validate_cascade(cascade: cv2.CascadeClassifier, name: str) -> cv2.CascadeC
 
 FACE_CASCADE = _validate_cascade(FACE_CASCADE, "frontal face")
 EYE_CASCADE = _validate_cascade(EYE_CASCADE, "eye")
+
+
+FaceRect = Tuple[int, int, int, int]
+
+
+def _split_stereo_faces(faces: Sequence[FaceRect], frame_width: int) -> Tuple[list[FaceRect], list[FaceRect]]:
+    """Separate detections into left and right halves of a stereo frame."""
+
+    half_width = frame_width // 2
+    left_faces: list[FaceRect] = []
+    right_faces: list[FaceRect] = []
+
+    for (x, y, w, h) in faces:
+        center_x = x + w / 2
+        if center_x < half_width:
+            left_faces.append((x, y, w, h))
+        else:
+            right_faces.append((x, y, w, h))
+
+    return left_faces, right_faces
+
+
+def _match_stereo_faces(
+    faces: Sequence[FaceRect], frame_width: int, frame_height: int
+) -> Optional[Tuple[FaceRect, FaceRect]]:
+    """Return a pair of faces that likely depict the same person in stereo views."""
+
+    left_faces, right_faces = _split_stereo_faces(faces, frame_width)
+    if not left_faces or not right_faces:
+        return None
+
+    half_width = frame_width / 2.0
+    best_score = float("inf")
+    best_pair: Optional[Tuple[FaceRect, FaceRect]] = None
+
+    for left in left_faces:
+        lx, ly, lw, lh = left
+        left_center_x = (lx + lw / 2.0) / half_width
+        left_center_y = (ly + lh / 2.0) / frame_height
+        left_width = lw / half_width
+
+        for right in right_faces:
+            rx, ry, rw, rh = right
+            right_center_x = ((rx - half_width) + rw / 2.0) / half_width
+            right_center_y = (ry + rh / 2.0) / frame_height
+            right_width = rw / half_width
+
+            dx = left_center_x - right_center_x
+            dy = left_center_y - right_center_y
+            dw = left_width - right_width
+            score = dx * dx + dy * dy + 0.25 * dw * dw
+
+            if score < best_score:
+                best_score = score
+                best_pair = (left, right)
+
+    # Require strong similarity between the two detections.
+    if best_score > 0.3 * 0.3:
+        return None
+
+    return best_pair
+
+
+def _estimate_eye_midpoint(face: FaceRect, gray_frame) -> Tuple[int, int]:
+    """Estimate the midpoint between the subject's eyes in ``face``."""
+
+    x, y, w, h = face
+    face_region = gray_frame[y : y + h, x : x + w]
+    eyes = EYE_CASCADE.detectMultiScale(
+        face_region, scaleFactor=1.1, minNeighbors=8, minSize=(20, 20)
+    )
+
+    if len(eyes) >= 2:
+        eyes = sorted(eyes, key=lambda bbox: bbox[2] * bbox[3], reverse=True)[:2]
+        centers = [
+            (x + ex + ew / 2.0, y + ey + eh / 2.0)
+            for (ex, ey, ew, eh) in eyes
+        ]
+        mid_x = sum(center[0] for center in centers) / len(centers)
+        mid_y = sum(center[1] for center in centers) / len(centers)
+    elif len(eyes) == 1:
+        ex, ey, ew, eh = max(eyes, key=lambda bbox: bbox[2] * bbox[3])
+        mid_x = x + w / 2.0
+        mid_y = y + ey + eh / 2.0
+    else:
+        mid_x = x + w / 2.0
+        mid_y = y + h / 3.0
+
+    return int(round(mid_x)), int(round(mid_y))
+
+
+def _draw_cross(frame, face: FaceRect, midpoint: Tuple[int, int]) -> None:
+    """Draw a crosshair centered on ``midpoint`` scaled relative to ``face``."""
+
+    x, y, w, h = face
+    center_x, center_y = midpoint
+    half_length = max(int(min(w, h) * 0.15), 10)
+
+    cv2.line(
+        frame,
+        (center_x - half_length, center_y),
+        (center_x + half_length, center_y),
+        (0, 0, 255),
+        2,
+    )
+    cv2.line(
+        frame,
+        (center_x, center_y - half_length),
+        (center_x, center_y + half_length),
+        (0, 0, 255),
+        2,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -83,37 +195,13 @@ def display_feed(capture: cv2.VideoCapture, window_name: str) -> None:
                 gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60)
             )
 
-            # Prioritize the largest faces in the frame and only annotate up to two.
-            faces = sorted(faces, key=lambda bbox: bbox[2] * bbox[3], reverse=True)[:2]
+            match = _match_stereo_faces(faces, frame.shape[1], frame.shape[0])
 
-            for (x, y, w, h) in faces:
-                face_region = gray[y : y + h, x : x + w]
-                eyes = EYE_CASCADE.detectMultiScale(
-                    face_region, scaleFactor=1.1, minNeighbors=10, minSize=(20, 20)
-                )
-
-                for (ex, ey, ew, eh) in sorted(
-                    eyes, key=lambda bbox: bbox[2] * bbox[3], reverse=True
-                )[:2]:
-                    center_x = x + ex + ew // 2
-                    center_y = y + ey + eh // 2
-                    half_length = max(ew, eh) // 2
-                    half_length = max(half_length, 10)  # keep the cross visible
-
-                    cv2.line(
-                        frame,
-                        (center_x - half_length, center_y),
-                        (center_x + half_length, center_y),
-                        (0, 0, 255),
-                        2,
-                    )
-                    cv2.line(
-                        frame,
-                        (center_x, center_y - half_length),
-                        (center_x, center_y + half_length),
-                        (0, 0, 255),
-                        2,
-                    )
+            if match is not None:
+                left_face, right_face = match
+                for face in (left_face, right_face):
+                    midpoint = _estimate_eye_midpoint(face, gray)
+                    _draw_cross(frame, face, midpoint)
 
             cv2.imshow(window_name, frame)
 
