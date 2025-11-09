@@ -26,3 +26,15 @@ uv run window -- --camera-index 1 --window-name "Secondary camera"
 ```
 
 Press the `q` key while the preview window has focus to exit the application.
+
+### Windows-specific notes
+
+- Run `uv run window` from a terminal that is pointed at the project root
+  (the directory containing `pyproject.toml`).  uv builds an editable wheel of
+  the project, so running the command from elsewhere can trigger a packaging
+  error about missing files.
+- If you have multiple Python installations, prefer the one that uv reports in
+  the error message.  You can confirm which interpreter uv will use with
+  `uv python find`.
+- Windows may prompt you for camera access the first time you run the preview;
+  grant access for the application to show the webcam feed.
