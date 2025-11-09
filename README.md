@@ -12,23 +12,17 @@ preview utility that displays the live feed from a webcam.
 
 ## Getting started
 
-1. Create a virtual environment and install dependencies with uv:
+1. Launch the preview window with uv:
    ```bash
-   uv venv
-   uv pip install -r pyproject.toml
+   uv run window
    ```
-   Alternatively, you can activate the environment and rely on uv's resolver:
-   ```bash
-   source .venv/bin/activate
-   uv pip install opencv-python
-   ```
-2. Launch the preview window:
-   ```bash
-   python window.py
-   ```
+   The first run will resolve and install the declared dependencies.
 
 By default the script opens camera index `0` and names the preview window
 `skywindow`.  Override either of those defaults by passing the `--camera-index`
-or `--window-name` options.
+or `--window-name` options after a `--` separator:
+```bash
+uv run window -- --camera-index 1 --window-name "Secondary camera"
+```
 
 Press the `q` key while the preview window has focus to exit the application.
